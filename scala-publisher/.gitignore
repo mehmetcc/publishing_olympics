@@ -1,0 +1,39 @@
+# --- Scala/SBT/Metals ---
+.bloop/
+.bsp/
+.metals/
+.idea/
+*.iml
+project/target/
+project/project/
+project/.sbt
+project/metals.sbt
+project/project/metals.sbt
+metals.sbt
+sbt.json
+project/
+target
+coursier
+
+# --- Node/Website ---
+website/node_modules/
+website/.docusaurus/
+website/build/
+website/docs/
+website/static/api*
+website/i18n/en.json
+website/yarn.lock
+website/package-lock.json
+website/static/api/
+website/yarn-error.log
+website/ecosystem-sidebar.js
+
+# --- Test/Output files ---
+test-output/
+test.txt
+input.txt
+output.txt
+intermediary/
+
+# --- VSCode ---
+.vscode/
