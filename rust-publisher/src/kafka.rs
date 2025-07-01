@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::nonsense::Nonsense;
-use crossbeam_channel::{Receiver, select};
+use crossbeam_channel::{Receiver, select, tick};
 use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::sync::Arc;
@@ -14,11 +14,8 @@ pub struct KafkaSink {
 
 impl KafkaSink {
     pub fn new(config: Arc<AppConfig>) -> anyhow::Result<Self> {
-        let future_producer = future_producer(config.as_ref())?;
-        Ok(Self {
-            config,
-            producer: future_producer,
-        })
+        let producer = future_producer(config.as_ref())?;
+        Ok(Self { config, producer })
     }
 
     pub async fn dispatch_loop(
@@ -26,46 +23,51 @@ impl KafkaSink {
         rx: Receiver<Nonsense>,
         shutdown_rx: Receiver<()>,
     ) -> anyhow::Result<()> {
-        let mut buffer: Vec<Nonsense> = Vec::new();
+        let mut buffer = Vec::with_capacity(self.config.dispatch.batch_size);
+        let ticker = tick(Duration::from_millis(
+            self.config.dispatch.flush_interval_ms,
+        ));
 
         loop {
             select! {
-                recv(shutdown_rx) -> _ => {
-                    tracing::info!("Shutdown signal received. Flushing remaining messages.");
-                    return Ok(());
-                }
+                recv(shutdown_rx) -> _ => break,
+                recv(rx) -> msg => match msg {
+                    Ok(m) => buffer.push(m),
+                    Err(_) => break, // upstream hung up
+                },
 
-                recv(rx) -> msg => {
-                    if let Ok(message) = msg {
-                        buffer.push(message);
-                    } else {
-                        return Ok(()); // sender hung up
+                recv(ticker) -> _ => {
+                    if !buffer.is_empty() {
+                        let to_flush = buffer.len().min(self.config.dispatch.batch_size);
+                        self.flush_n(&mut buffer, to_flush).await?;
                     }
-                }
-
-                default(Duration::from_millis(self.config.dispatch.flush_interval_ms)) => {
-                    self.config.dispatch.batch_size;
                 }
             }
 
             if buffer.len() >= self.config.dispatch.batch_size {
-                let len = self.config.dispatch.batch_size;
-                self.flush_n(&mut buffer, len).await?;
+                self.flush_n(&mut buffer, self.config.dispatch.batch_size)
+                    .await?;
             }
         }
+
+        let remaining = buffer.len();
+        if remaining > 0 {
+            self.flush_n(&mut buffer, remaining).await?;
+        }
+
+        Ok(())
     }
 
-    async fn flush_n(&self, buffer: &mut Vec<Nonsense>, n: usize) -> anyhow::Result<usize> {
-        let count = n.min(buffer.len());
+    async fn flush_n(&self, buffer: &mut Vec<Nonsense>, count: usize) -> anyhow::Result<()> {
+        let count = count.min(buffer.len());
         let to_send = buffer.drain(..count).collect::<Vec<_>>();
-        self.send_batch(to_send).await?;
-        Ok(count)
+        self.send_batch(to_send).await
     }
 
     async fn send_batch(&self, messages: Vec<Nonsense>) -> anyhow::Result<()> {
-        for message in messages {
-            let payload = message.to_json()?;
-            let key = message.id.to_string();
+        for msg in messages {
+            let payload = msg.to_json()?;
+            let key = msg.id.to_string();
 
             let record = FutureRecord::to(&self.config.producer.topic)
                 .payload(&payload)
@@ -80,13 +82,11 @@ impl KafkaSink {
                 .map_err(|(e, _)| {
                     error_span!(
                         "kafka_send_error",
-                        error = %e,
-                        topic = %self.config.producer.topic,
+                        error     = %e,
+                        topic     = %self.config.producer.topic,
                         thread_id = ?std::thread::current().id(),
                     )
-                    .in_scope(|| {
-                        error!("Failed to send message to Kafka");
-                    });
+                    .in_scope(|| error!("Failed to send message to Kafka"));
                     anyhow::Error::msg(e.to_string())
                 })?;
         }
@@ -95,9 +95,8 @@ impl KafkaSink {
 }
 
 fn future_producer(config: &AppConfig) -> anyhow::Result<FutureProducer> {
-    let mut client_config = ClientConfig::new();
-    client_config
-        .set("bootstrap.servers", &config.producer.brokers)
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", &config.producer.brokers)
         .set("compression.type", &config.producer.compression)
         .set("acks", &config.producer.acks)
         .set(
@@ -108,6 +107,5 @@ fn future_producer(config: &AppConfig) -> anyhow::Result<FutureProducer> {
             "queue.buffering.max.ms",
             &config.producer.buffering_max_ms.to_string(),
         );
-
-    client_config.create().map_err(|e| e.into())
+    cfg.create().map_err(|e| e.into())
 }

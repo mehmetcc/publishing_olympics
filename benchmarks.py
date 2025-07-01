@@ -6,7 +6,7 @@ import sys
 import psutil 
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-RUST_DIR     = "rust-producer"
+RUST_DIR     = "rust-publisher"
 SCALA_DIR    = "scala-publisher"
 KAFKA_CONTAINER = "kafka"
 BROKER       = "localhost:9092"
