@@ -1,11 +1,11 @@
 use crate::config::AppConfig;
 use crate::nonsense::Nonsense;
-use crossbeam_channel::{Receiver, select, tick};
+use crossbeam_channel::Receiver;
+use futures::stream::{FuturesUnordered, StreamExt};
 use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::{error, error_span};
+use std::time::{Duration, Instant};
 
 pub struct KafkaSink {
     config: Arc<AppConfig>,
@@ -18,85 +18,84 @@ impl KafkaSink {
         Ok(Self { config, producer })
     }
 
-    pub async fn dispatch_loop(
-        &self,
-        rx: Receiver<Nonsense>,
-        shutdown_rx: Receiver<()>,
-    ) -> anyhow::Result<()> {
+    pub async fn dispatch_loop(&self, rx: Receiver<Nonsense>) -> anyhow::Result<()> {
         let mut buffer = Vec::with_capacity(self.config.dispatch.batch_size);
-        let ticker = tick(Duration::from_millis(
-            self.config.dispatch.flush_interval_ms,
-        ));
+        let mut last_flush = Instant::now();
+        let timeout_ms = self.config.dispatch.flush_interval_ms;
 
         loop {
-            select! {
-                recv(shutdown_rx) -> _ => break,
-                recv(rx) -> msg => match msg {
-                    Ok(m) => buffer.push(m),
-                    Err(_) => break, // upstream hung up
-                },
+            match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+                Ok(msg) => {
+                    buffer.push(msg);
 
-                recv(ticker) -> _ => {
+                    if buffer.len() >= self.config.dispatch.batch_size {
+                        let to_flush = buffer.len().min(self.config.dispatch.batch_size);
+                        self.flush_n(&mut buffer, to_flush).await?;
+                        last_flush = Instant::now();
+                    }
+                }
+
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if !buffer.is_empty() {
                         let to_flush = buffer.len().min(self.config.dispatch.batch_size);
                         self.flush_n(&mut buffer, to_flush).await?;
+                        last_flush = Instant::now();
                     }
                 }
-            }
 
-            if buffer.len() >= self.config.dispatch.batch_size {
-                self.flush_n(&mut buffer, self.config.dispatch.batch_size)
-                    .await?;
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    if !buffer.is_empty() {
+                        let remaining = buffer.len();
+                        self.flush_n(&mut buffer, remaining).await?;
+                    }
+                    return Ok(());
+                }
             }
         }
-
-        let remaining = buffer.len();
-        if remaining > 0 {
-            self.flush_n(&mut buffer, remaining).await?;
-        }
-
-        Ok(())
     }
 
-    async fn flush_n(&self, buffer: &mut Vec<Nonsense>, count: usize) -> anyhow::Result<()> {
-        let count = count.min(buffer.len());
+    async fn flush_n(&self, buffer: &mut Vec<Nonsense>, n: usize) -> anyhow::Result<usize> {
+        let count = n.min(buffer.len());
         let to_send = buffer.drain(..count).collect::<Vec<_>>();
-        self.send_batch(to_send).await
+        self.send_batch(to_send).await?;
+        Ok(count)
     }
 
     async fn send_batch(&self, messages: Vec<Nonsense>) -> anyhow::Result<()> {
+        let timeout = Duration::from_millis(self.config.producer.timeout_ms);
+        let topic_base = self.config.producer.topic.clone();
+        let mut in_flight = FuturesUnordered::new();
+
         for msg in messages {
             let payload = msg.to_json()?;
             let key = msg.id.to_string();
+            let topic = topic_base.clone();
+            let producer = self.producer.clone();
 
-            let record = FutureRecord::to(&self.config.producer.topic)
-                .payload(&payload)
-                .key(&key);
+            in_flight.push(async move {
+                let record = FutureRecord::to(&topic).payload(&payload).key(&key);
 
-            self.producer
-                .send(
-                    record,
-                    Duration::from_millis(self.config.producer.timeout_ms),
-                )
-                .await
-                .map_err(|(e, _)| {
-                    error_span!(
-                        "kafka_send_error",
-                        error     = %e,
-                        topic     = %self.config.producer.topic,
-                        thread_id = ?std::thread::current().id(),
-                    )
-                    .in_scope(|| error!("Failed to send message to Kafka"));
-                    anyhow::Error::msg(e.to_string())
-                })?;
+                producer
+                    .send(record, timeout)
+                    .await
+                    .map_err(|(e, _)| anyhow::anyhow!(e))
+            });
         }
+
+        while let Some(result) = in_flight.next().await {
+            if let Err(e) = result {
+                tracing::error!("Kafka send failed: {}", e);
+            }
+        }
+
         Ok(())
     }
 }
 
 fn future_producer(config: &AppConfig) -> anyhow::Result<FutureProducer> {
-    let mut cfg = ClientConfig::new();
-    cfg.set("bootstrap.servers", &config.producer.brokers)
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", &config.producer.brokers)
         .set("compression.type", &config.producer.compression)
         .set("acks", &config.producer.acks)
         .set(
@@ -107,5 +106,5 @@ fn future_producer(config: &AppConfig) -> anyhow::Result<FutureProducer> {
             "queue.buffering.max.ms",
             &config.producer.buffering_max_ms.to_string(),
         );
-    cfg.create().map_err(|e| e.into())
+    client_config.create().map_err(Into::into)
 }

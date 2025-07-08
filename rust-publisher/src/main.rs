@@ -2,6 +2,7 @@ use crate::config::AppConfig;
 use crate::generator::start_generators;
 use crate::kafka::KafkaSink;
 use crate::nonsense::Nonsense;
+use crossbeam_channel::bounded;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*};
@@ -13,33 +14,46 @@ mod nonsense;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env, set up logging & Rayon
     dotenv::dotenv().ok();
     init_logger();
     configure_pool()?;
 
+    // Load config and optional throttle
     let config = Arc::new(AppConfig::new()?);
-    let throttle = if config.concurrency.throttling_enabled {
-        Some(Duration::from_millis(config.concurrency.throttling_ms))
-    } else {
-        None
-    };
+    let throttle = config
+        .concurrency
+        .throttling_enabled
+        .then(|| Duration::from_millis(config.concurrency.throttling_ms));
 
-    let (tx, rx) = crossbeam_channel::bounded::<Nonsense>(10_000);
-    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+    // Channel for generated Nonsense
+    let (tx, rx) = bounded::<Nonsense>(10_000);
 
-    // Handle SIGINT
-    {
-        let shutdown_tx = shutdown_tx.clone();
-        ctrlc::set_handler(move || {
-            let _ = shutdown_tx.send(());
-        })?;
-    }
-
-    start_generators(available_cores(), tx, throttle);
+    // Start your generators on a clone of tx
+    start_generators(available_cores(), tx.clone(), throttle);
     tracing::info!("Started {} generator threads", available_cores());
 
+    // Create the Kafka sink and its dispatch future
     let sink = KafkaSink::new(config.clone())?;
-    sink.dispatch_loop(rx, shutdown_rx).await?;
+    let mut dispatch_fut = sink.dispatch_loop(rx);
+    tokio::pin!(dispatch_fut);
+
+    // Phase 1: wait for either Ctrl+C or dispatch_loop to finish naturally
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGINT received — shutting down generators");
+            // Closing the channel signals dispatch_loop to flush+exit
+            drop(tx);
+        }
+        res = &mut dispatch_fut => {
+            // dispatch_loop ended on its own (e.g. generators all hung up)
+            res?;
+            return Ok(());
+        }
+    }
+
+    // Phase 2: after Ctrl+C, let dispatch_loop finish flushing
+    dispatch_fut.await?;
 
     Ok(())
 }
